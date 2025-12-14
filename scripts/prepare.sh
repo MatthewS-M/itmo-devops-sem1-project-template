@@ -83,11 +83,11 @@ $PSQL_CMD -c "GRANT ALL PRIVILEGES ON DATABASE \"project-sem-1\" TO validator;" 
 echo "Создание таблицы prices..."
 PGPASSWORD=val1dat0r psql -h localhost -U validator -d project-sem-1 -c "
 CREATE TABLE IF NOT EXISTS prices (
-    id INTEGER,
-    name VARCHAR(255),
-    category VARCHAR(255),
-    price DECIMAL(10, 2),
-    create_date DATE
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    category VARCHAR(255) NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    create_date TIMESTAMP NOT NULL
 );" || true
 
 echo "=== Подготовка завершена ==="
