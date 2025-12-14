@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 	"database/sql"
 )
@@ -74,11 +73,11 @@ func initDB() error {
 
 	createTableQuery := `
 	CREATE TABLE IF NOT EXISTS prices (
-		id INTEGER,
-		name VARCHAR(255),
-		category VARCHAR(255),
-		price DECIMAL(10, 2),
-		create_date DATE
+		id SERIAL PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		category VARCHAR(255) NOT NULL,
+		price DECIMAL(10, 2) NOT NULL,
+		create_date TIMESTAMP NOT NULL
 	);`
 
 	_, err = db.Exec(createTableQuery)
@@ -106,11 +105,6 @@ func parseCSV(reader io.Reader) ([]PriceRecord, error) {
 			continue
 		}
 
-		id, err := strconv.Atoi(strings.TrimSpace(record[0]))
-		if err != nil {
-			continue
-		}
-
 		name := strings.TrimSpace(record[1])
 		category := strings.TrimSpace(record[2])
 
@@ -125,7 +119,6 @@ func parseCSV(reader io.Reader) ([]PriceRecord, error) {
 		}
 
 		priceRecords = append(priceRecords, PriceRecord{
-			ID:         id,
 			Name:       name,
 			Category:   category,
 			Price:      price,
@@ -192,37 +185,49 @@ func extractTarArchive(file io.Reader) ([]PriceRecord, error) {
 	return nil, fmt.Errorf("data.csv not found in archive")
 }
 
-func insertRecords(records []PriceRecord) error {
-	for _, record := range records {
-		insertQuery := `
-		INSERT INTO prices (id, name, category, price, create_date)
-		VALUES ($1, $2, $3, $4, $5);`
+func insertRecordsAndGetStats(records []PriceRecord) (int, int, float64, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer tx.Rollback()
 
-		_, err := db.Exec(insertQuery, record.ID, record.Name, record.Category, record.Price, record.CreateDate)
+	var minID int
+	err = tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM prices").Scan(&minID)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	insertQuery := `INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)`
+	stmt, err := tx.Prepare(insertQuery)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer stmt.Close()
+
+	for _, record := range records {
+		_, err := stmt.Exec(record.Name, record.Category, record.Price, record.CreateDate)
 		if err != nil {
-			continue
+			return 0, 0, 0, err
 		}
 	}
 
-	return nil
-}
-
-func getStats() (int, int, float64, error) {
 	var totalItems int
 	var totalPrice float64
 	var totalCategories int
-
-	err := db.QueryRow("SELECT COUNT(*) FROM prices").Scan(&totalItems)
+	err = tx.QueryRow(`
+		SELECT 
+			COUNT(*),
+			COALESCE(SUM(price), 0),
+			COUNT(DISTINCT category)
+		FROM prices
+		WHERE id > $1
+	`, minID).Scan(&totalItems, &totalPrice, &totalCategories)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 
-	err = db.QueryRow("SELECT COALESCE(SUM(price), 0) FROM prices").Scan(&totalPrice)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-
-	err = db.QueryRow("SELECT COUNT(DISTINCT category) FROM prices").Scan(&totalCategories)
+	err = tx.Commit()
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -251,7 +256,8 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 
 	var records []PriceRecord
 
-	if archiveType == "zip" {
+	switch archiveType {
+	case "zip":
 		fileBytes, err := io.ReadAll(file)
 		if err != nil {
 			http.Error(w, "Error reading file", http.StatusInternalServerError)
@@ -264,26 +270,20 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Error extracting zip: %v", err), http.StatusBadRequest)
 			return
 		}
-	} else if archiveType == "tar" {
+	case "tar":
 		records, err = extractTarArchive(file)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Error extracting tar: %v", err), http.StatusBadRequest)
 			return
 		}
-	} else {
+	default:
 		http.Error(w, "Unsupported archive type", http.StatusBadRequest)
 		return
 	}
 
-	err = insertRecords(records)
+	totalItems, totalCategories, totalPrice, err := insertRecordsAndGetStats(records)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error inserting records: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	totalItems, totalCategories, totalPrice, err := getStats()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error getting stats: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -294,7 +294,10 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, fmt.Sprintf("Error encoding response: %v", err), http.StatusInternalServerError)
+		return
+	}
 }
 
 func handleGetPrices(w http.ResponseWriter, r *http.Request) {
@@ -316,15 +319,13 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 		records = append(records, record)
 	}
 
-	tmpFile, err := os.CreateTemp("", "prices-*.zip")
-	if err != nil {
-		http.Error(w, "Error creating temp file", http.StatusInternalServerError)
+	if err := rows.Err(); err != nil {
+		http.Error(w, fmt.Sprintf("Error iterating rows: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
 
-	zipWriter := zip.NewWriter(tmpFile)
+	var zipBuffer bytes.Buffer
+	zipWriter := zip.NewWriter(&zipBuffer)
 	csvFile, err := zipWriter.Create("data.csv")
 	if err != nil {
 		http.Error(w, "Error creating csv in zip", http.StatusInternalServerError)
@@ -345,12 +346,17 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	csvWriter.Flush()
-	zipWriter.Close()
+	if err := zipWriter.Close(); err != nil {
+		http.Error(w, fmt.Sprintf("Error closing zip: %v", err), http.StatusInternalServerError)
+		return
+	}
 
-	tmpFile.Seek(0, 0)
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
-	io.Copy(w, tmpFile)
+	if _, err := io.Copy(w, &zipBuffer); err != nil {
+		http.Error(w, fmt.Sprintf("Error writing response: %v", err), http.StatusInternalServerError)
+		return
+	}
 }
 
 func main() {
@@ -360,10 +366,18 @@ func main() {
 	}
 	defer db.Close()
 
-	r := mux.NewRouter()
-	r.HandleFunc("/api/v0/prices", handlePostPrices).Methods("POST")
-	r.HandleFunc("/api/v0/prices", handleGetPrices).Methods("GET")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			handlePostPrices(w, r)
+		case http.MethodGet:
+			handleGetPrices(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 
 	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }
