@@ -192,12 +192,6 @@ func insertRecordsAndGetStats(records []PriceRecord) (int, int, float64, error) 
 	}
 	defer tx.Rollback()
 
-	var minID int
-	err = tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM prices").Scan(&minID)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-
 	insertQuery := `INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)`
 	stmt, err := tx.Prepare(insertQuery)
 	if err != nil {
@@ -205,26 +199,17 @@ func insertRecordsAndGetStats(records []PriceRecord) (int, int, float64, error) 
 	}
 	defer stmt.Close()
 
-	for _, record := range records {
-		_, err := stmt.Exec(record.Name, record.Category, record.Price, record.CreateDate)
-		if err != nil {
-			return 0, 0, 0, err
-		}
-	}
-
 	var totalItems int
 	var totalPrice float64
-	var totalCategories int
-	err = tx.QueryRow(`
-		SELECT 
-			COUNT(*),
-			COALESCE(SUM(price), 0),
-			COUNT(DISTINCT category)
-		FROM prices
-		WHERE id > $1
-	`, minID).Scan(&totalItems, &totalPrice, &totalCategories)
-	if err != nil {
-		return 0, 0, 0, err
+	categorySet := make(map[string]struct{})
+
+	for _, record := range records {
+		if _, err := stmt.Exec(record.Name, record.Category, record.Price, record.CreateDate); err != nil {
+			return 0, 0, 0, err
+		}
+		totalItems++
+		totalPrice += record.Price
+		categorySet[record.Category] = struct{}{}
 	}
 
 	err = tx.Commit()
@@ -232,7 +217,7 @@ func insertRecordsAndGetStats(records []PriceRecord) (int, int, float64, error) 
 		return 0, 0, 0, err
 	}
 
-	return totalItems, totalCategories, totalPrice, nil
+	return totalItems, len(categorySet), totalPrice, nil
 }
 
 func handlePostPrices(w http.ResponseWriter, r *http.Request) {
@@ -379,5 +364,7 @@ func main() {
 	})
 
 	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Printf("Server stopped: %v", err)
+	}
 }
